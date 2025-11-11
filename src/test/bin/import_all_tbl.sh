@@ -78,7 +78,7 @@ for tbl_file in "${files[@]}"; do
 
     # 构建 \copy 命令，从标准输入(STDIN)读取数据
     # 这是关键的改动，psql 将从管道接收数据，而不是直接读取文件
-    COMMAND="\copy ${TABLE_NAME} FROM STDIN WITH (FORMAT csv, DELIMITER E'\t')"
+    COMMAND="\copy ${TABLE_NAME}(geom,dtg,taxi_id) FROM STDIN WITH (FORMAT csv, DELIMITER E'\t')"
 
     # 执行导入
     # 1. `cat "${tbl_file}"`: 在主机上读取文件内容并输出到标准输出。
