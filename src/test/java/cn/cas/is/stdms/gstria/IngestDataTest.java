@@ -21,10 +21,7 @@ import org.locationtech.jts.geom.Point;
 import org.opengis.feature.simple.SimpleFeature;
 import org.opengis.feature.simple.SimpleFeatureType;
 
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
@@ -38,7 +35,7 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 @Slf4j
-public class CreateSchemaTest {
+public class IngestDataTest {
     public static DataStoreConfig dataStoreConfig = DataStoreConfig.PPG;
     public static String spec = "*geom:Point:srid=4326,dtg:Date,taxi_id:Integer";
     public static String typeName = "performance";
