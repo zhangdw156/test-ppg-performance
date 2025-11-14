@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# Shell脚本：批量导入 .tbl 文件到 PostgreSQL Docker 容器并计时
+# Shell脚本：批量导入 .tbl 文件到 PostgreSQL Docker 容器并计时（精确到毫秒）
 #
 # 使用方法:
 # 1. 修改下面的 "--- 配置区 ---" 中的容器名、数据库信息和文件目录。
@@ -24,8 +24,8 @@ DB_PASSWD="ds123456"
 TBL_DIR="/home/gstria/datasets/beijingshi_tbl"
 
 
-# 记录脚本总开始时间 (使用 Unix 时间戳)
-start_total_time=$(date +%s)
+# 记录脚本总开始时间 (纳秒级时间戳，精确到小数点后9位)
+start_total_time=$(date +%s.%N)
 
 # 检查 docker 命令是否存在
 if ! command -v docker &> /dev/null
@@ -68,7 +68,7 @@ echo "共找到 ${#files[@]} 个 .tbl 文件需要导入。"
 # 计数器
 success_count=0
 fail_count=0
-total_import_time=0
+total_import_time=0  # 累计导入时间（浮点数）
 
 # 遍历找到的每一个 .tbl 文件
 for tbl_file in "${files[@]}"; do
@@ -79,7 +79,8 @@ for tbl_file in "${files[@]}"; do
     # 构建 \copy 命令
     COMMAND="copy ${TABLE_NAME}(fid,geom,dtg,taxi_id) FROM STDIN WITH (FORMAT text, DELIMITER '|', NULL '');"
 
-    start_file_time=$(date +%s)
+    # 记录单个文件开始时间（纳秒级）
+    start_file_time=$(date +%s.%N)
 
     # 执行导入
     cat "${tbl_file}" | docker exec \
@@ -90,15 +91,17 @@ for tbl_file in "${files[@]}"; do
 
     # 检查退出状态码
     if [ $? -eq 0 ]; then
-        # 新增：记录单个文件导入的结束时间
-        end_file_time=$(date +%s)
-        # 新增：计算单个文件导入耗时
-        file_duration=$((end_file_time - start_file_time))
+        # 记录单个文件结束时间（纳秒级）
+        end_file_time=$(date +%s.%N)
+        # 计算单个文件导入耗时（保留3位小数）
+        file_duration=$(echo "scale=3; $end_file_time - $start_file_time" | bc)
 
-        echo "成功: 文件 '$filename' 已成功导入。耗时: ${file_duration} 秒。"
+        # 格式化显示（确保3位小数）
+        printf "成功: 文件 '%s' 已成功导入。耗时: %.3f 秒。\n" "$filename" "$file_duration"
+
         ((success_count++))
-        # 新增：将本次耗时累加到总耗时中
-        total_import_time=$((total_import_time + file_duration))
+        # 累加总导入时间（保留3位小数）
+        total_import_time=$(echo "scale=3; $total_import_time + $file_duration" | bc)
     else
         echo "失败: 导入文件 '$filename' 时发生错误。"
         ((fail_count++))
@@ -106,23 +109,22 @@ for tbl_file in "${files[@]}"; do
 done
 
 # 记录脚本总结束时间
-end_total_time=$(date +%s)
-# 计算脚本总耗时
-total_duration=$((end_total_time - start_total_time))
+end_total_time=$(date +%s.%N)
+# 计算脚本总耗时（保留3位小数）
+total_duration=$(echo "scale=3; $end_total_time - $start_total_time" | bc)
 
 echo "=================================================="
 echo "所有文件处理完毕。"
 echo "成功导入: $success_count 个文件"
 echo "导入失败: $fail_count 个文件"
 echo "--------------------------------------------------"
-echo "脚本总执行时间: ${total_duration} 秒。"
+# 格式化总时间显示
+printf "脚本总执行时间: %.3f 秒。\n" "$total_duration"
 
-# 新增：计算并显示平均导入时间
-# 只有在成功导入至少一个文件时才计算平均值，避免除以零的错误
+# 计算并显示平均导入时间（保留3位小数）
 if [ $success_count -gt 0 ]; then
-    # 使用 bc 计算器进行浮点数除法，保留两位小数
-    average_time=$(echo "scale=2; $total_import_time / $success_count" | bc)
-    echo "平均每个文件的导入时间: ${average_time} 秒。"
+    average_time=$(echo "scale=3; $total_import_time / $success_count" | bc)
+    printf "平均每个文件的导入时间: %.3f 秒。\n" "$average_time"
 fi
 echo "=================================================="
 
