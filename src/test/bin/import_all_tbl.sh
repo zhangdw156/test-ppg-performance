@@ -1,32 +1,31 @@
 #!/bin/bash
 
 # ==============================================================================
-# Shell脚本：批量导入 .tbl 文件到 PostgreSQL Docker 容器
+# Shell脚本：批量导入 .tbl 文件到 PostgreSQL Docker 容器并计时
 #
 # 使用方法:
 # 1. 修改下面的 "--- 配置区 ---" 中的容器名、数据库信息和文件目录。
-# 2. 在终端中给予此脚本执行权限: chmod +x import_tbl_via_docker.sh
-# 3. 运行脚本: ./import_tbl_via_docker.sh
+# 2. 在终端中给予此脚本执行权限: chmod +x import_all_tbl.sh
+# 3. 运行脚本: ./import_all_tbl.sh
 # ==============================================================================
 
 # --- 配置区 ---
 
 # 1. Docker 容器名
-#    请确保将此名称替换为您正在运行的 PostgreSQL 容器的实际名称或ID
-CONTAINER_NAME="stag-gstria-postgis_postgis_1" # <--- 修改这里！
+CONTAINER_NAME="stag-gstria-postgis_postgis_1"
 
 # 2. 数据库连接详细信息
-#    当 psql 在容器内部运行时，主机名通常是 'localhost'
 DB_USER="postgres"
 DB_NAME="postgres"
 TABLE_NAME="performance"
 DB_PASSWD="ds123456"
 
 # 3. 存放 .tbl 文件的目录
-#    这仍然是主机上的路径，脚本会从这里读取文件
-TBL_DIR="/home/gstria/datasets/beijingshi_tbl" # <--- 修改这里！
+TBL_DIR="/home/gstria/datasets/beijingshi_tbl"
 
-# --- 脚本主逻辑 (通常无需修改以下内容) ---
+
+# 记录脚本总开始时间 (使用 Unix 时间戳)
+start_total_time=$(date +%s)
 
 # 检查 docker 命令是否存在
 if ! command -v docker &> /dev/null
@@ -69,6 +68,7 @@ echo "共找到 ${#files[@]} 个 .tbl 文件需要导入。"
 # 计数器
 success_count=0
 fail_count=0
+total_import_time=0
 
 # 遍历找到的每一个 .tbl 文件
 for tbl_file in "${files[@]}"; do
@@ -76,37 +76,55 @@ for tbl_file in "${files[@]}"; do
     echo "--------------------------------------------------"
     echo "准备导入文件: $filename"
 
-    # 构建 \copy 命令，从标准输入(STDIN)读取数据
-    # 这是关键的改动，psql 将从管道接收数据，而不是直接读取文件
-    COMMAND="\copy ${TABLE_NAME}(geom,dtg,taxi_id) FROM STDIN WITH (FORMAT text, DELIMITER '|', NULL '')"
+    # 构建 \copy 命令
+    COMMAND="copy ${TABLE_NAME}(geom,dtg,taxi_id) FROM STDIN WITH (FORMAT text, DELIMITER '|', NULL '');"
+
+    # 新增：记录单个文件导入的开始时间
+    start_file_time=$(date +%s)
 
     # 执行导入
-    # 1. `cat "${tbl_file}"`: 在主机上读取文件内容并输出到标准输出。
-    # 2. `|`: 将 cat 的输出通过管道传给下一个命令。
-    # 3. `docker exec -i ...`: -i 标志让 docker exec 从标准输入读取数据。
-    # 4. `-e PGPASSWORD=...`: 将密码作为环境变量安全地传递给容器内的 psql。
     cat "${tbl_file}" | docker exec \
       -i \
       -e PGPASSWORD="${DB_PASSWD}" \
       "${CONTAINER_NAME}" \
       psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${COMMAND}"
 
-    # 检查上一个命令（整个管道）的退出状态码
+    # 检查退出状态码
     if [ $? -eq 0 ]; then
-        echo "成功: 文件 '$filename' 已成功导入。"
+        # 新增：记录单个文件导入的结束时间
+        end_file_time=$(date +%s)
+        # 新增：计算单个文件导入耗时
+        file_duration=$((end_file_time - start_file_time))
+
+        echo "成功: 文件 '$filename' 已成功导入。耗时: ${file_duration} 秒。"
         ((success_count++))
+        # 新增：将本次耗时累加到总耗时中
+        total_import_time=$((total_import_time + file_duration))
     else
         echo "失败: 导入文件 '$filename' 时发生错误。"
         ((fail_count++))
-        # 如果你希望在遇到第一个错误时就立即停止整个脚本，取消下面一行的注释
-        # exit 1
     fi
 done
+
+# 记录脚本总结束时间
+end_total_time=$(date +%s)
+# 计算脚本总耗时
+total_duration=$((end_total_time - start_total_time))
 
 echo "=================================================="
 echo "所有文件处理完毕。"
 echo "成功导入: $success_count 个文件"
 echo "导入失败: $fail_count 个文件"
+echo "--------------------------------------------------"
+echo "脚本总执行时间: ${total_duration} 秒。"
+
+# 新增：计算并显示平均导入时间
+# 只有在成功导入至少一个文件时才计算平均值，避免除以零的错误
+if [ $success_count -gt 0 ]; then
+    # 使用 bc 计算器进行浮点数除法，保留两位小数
+    average_time=$(echo "scale=2; $total_import_time / $success_count" | bc)
+    echo "平均每个文件的导入时间: ${average_time} 秒。"
+fi
 echo "=================================================="
 
 # 恢复 shell 选项

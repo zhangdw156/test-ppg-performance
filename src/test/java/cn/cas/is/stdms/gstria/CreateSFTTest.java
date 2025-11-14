@@ -4,18 +4,23 @@ import lombok.extern.slf4j.Slf4j;
 import org.geotools.data.DataStore;
 import org.geotools.data.DataStoreFinder;
 import org.geotools.data.DataUtilities;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
 import org.opengis.feature.simple.SimpleFeatureType;
 
 import java.util.Arrays;
 
 @Slf4j
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 public class CreateSFTTest {
     public static DataStoreConfig dataStoreConfig = DataStoreConfig.PPG;
     public static String spec = "*geom:Point:srid=4326,dtg:Date,taxi_id:Integer";
-    public static String typeName = "test1";
+    public static String typeName = "test01";
 
     @Test
+    @Order(1)
     public void testCreateSFT() throws Exception {
         DataStore ds = null;
         try {
@@ -34,6 +39,7 @@ public class CreateSFTTest {
     }
 
     @Test
+    @Order(2)
     public void testShowSFT() throws Exception {
         DataStore ds = null;
         try {
@@ -47,6 +53,7 @@ public class CreateSFTTest {
     }
 
     @Test
+    @Order(3)
     public void testRemoveSFT() throws Exception {
         DataStore ds = null;
         try {
