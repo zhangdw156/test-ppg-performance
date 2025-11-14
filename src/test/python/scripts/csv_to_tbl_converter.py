@@ -1,6 +1,7 @@
 import os
 import csv
 from datetime import datetime
+import uuid
 
 def generate_tbl_from_csv_folder(input_folder):
     """
@@ -66,7 +67,7 @@ def process_single_csv_to_tbl(csv_path, tbl_path):
             open(tbl_path, mode='w', encoding='utf-8', newline='') as outfile:
 
         csv_reader = csv.reader(infile, delimiter=',')
-        # 使用制表符作为.tbl文件的分隔符
+        # 使用'|'作为.tbl文件的分隔符
         tbl_writer = csv.writer(outfile, delimiter='|', quoting=csv.QUOTE_NONE, escapechar='\\')
 
         try:
@@ -92,13 +93,14 @@ def process_single_csv_to_tbl(csv_path, tbl_path):
                 lat = float(lat_str)
                 lng = float(lng_str)
 
-                # 将geom字段格式化为WKT（Well-Known Text）格式
-                # 这是PostGIS/Greenplum等数据库COPY命令常用的地理空间数据格式
                 geom_wkt = f"SRID=4326;POINT({lng} {lat})"
 
-                # 按照 COPY 命令需要的顺序组织数据
-                # 假设数据库表结构为 (geom, dtg, taxi_id)
-                tbl_row = [geom_wkt, dtg, taxi_id]
+                # <-- 新增：为每一行生成一个唯一的UUID作为Feature ID
+                feature_id = uuid.uuid4()
+
+                # <-- 修改：按照 (fid, geom, dtg, taxi_id) 的顺序组织数据
+                # 将 feature_id 转换为字符串并放在最前面
+                tbl_row = [str(feature_id), geom_wkt, dtg, taxi_id]
 
                 # 将处理好的行写入.tbl文件
                 tbl_writer.writerow(tbl_row)
