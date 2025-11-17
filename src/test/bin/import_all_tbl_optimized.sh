@@ -78,7 +78,7 @@ LOCAL_FILE_COUNT=$(ls ${TBL_DIR_IN_LOCAL}/*.tbl 2>/dev/null | wc -l)
 
 if [ "$CONTAINER_FILE_COUNT" -lt "$LOCAL_FILE_COUNT" ]; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') - 复制 ${LOCAL_FILE_COUNT} 个文件到容器..."
-    docker cp "${TBL_DIR_IN_LOCAL}/" "${CONTAINER_NAME}:${TBL_DIR_IN_CONTAINER}/"
+    docker cp "${TBL_DIR_IN_LOCAL}/*" "${CONTAINER_NAME}:${TBL_DIR_IN_CONTAINER}/"
 else
     echo "$(date '+%Y-%m-%d %H:%M:%S') - 容器中已存在文件，跳过复制步骤。"
 fi
