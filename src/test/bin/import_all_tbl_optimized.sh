@@ -386,14 +386,14 @@ for i in "${!files[@]}"; do
 
         # 自适应批大小调整
         if [ "$ADAPTIVE_BATCHING" = true ]; then
-            if [ "$throughput" -gt 25000 ]; then
+            if [ "$throughput" -gt 250000 ]; then
                 # 性能良好，增大批次
                 new_batch_size=$((BATCH_SIZE * 12 / 10))
                 if [ "$new_batch_size" -le 500 ]; then
                     BATCH_SIZE=$new_batch_size
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - 【自适应】吞吐量高，增大批大小至 $BATCH_SIZE"
                 fi
-            elif [ "$throughput" -lt 10000 ]; then
+            elif [ "$throughput" -lt 100000 ]; then
                 # 性能不佳，减小批次
                 new_batch_size=$((BATCH_SIZE * 8 / 10))
                 if [ "$new_batch_size" -ge 10 ]; then
@@ -523,7 +523,7 @@ printf "$(date '+%Y-%m-%d %H:%M:%S') - 脚本总执行时间: %d小时 %d分钟 
 # 计算并显示性能指标
 if [ $success_count -gt 0 ]; then
     average_time_per_file=$(echo "scale=3; $total_duration / $success_count" | bc)
-    total_rows=$((success_count * 10000))
+    total_rows=$((success_count * 100000))
     overall_throughput=$(echo "scale=0; $total_rows / $total_duration" | bc)
 
     printf "$(date '+%Y-%m-%d %H:%M:%S') - 平均每个文件的处理时间: %.3f 秒\n" "$average_time_per_file"
