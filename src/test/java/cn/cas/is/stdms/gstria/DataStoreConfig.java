@@ -10,7 +10,8 @@ import java.util.stream.Collectors;
 
 public enum DataStoreConfig {
 
-    PPG("geomesa.ppg");
+    PPG("geomesa.ppg"),
+    HBASE("geomesa.hbase");
 
     private static class ConfigHolder {
         private static final Config config = ConfigFactory.load();

@@ -15,7 +15,7 @@ import java.util.Arrays;
 @Slf4j
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 public class CreateSFTTest {
-    public static DataStoreConfig dataStoreConfig = DataStoreConfig.PPG;
+    public static DataStoreConfig dataStoreConfig = DataStoreConfig.HBASE;
     public static String spec = "*geom:Point:srid=4326,dtg:Date,taxi_id:Integer";
     public static String typeName = "performance";
 
