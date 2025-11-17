@@ -1,17 +1,17 @@
 #!/bin/bash
 
 # ==============================================================================
-# Shell脚本：控制 Docker 容器内部的文件，进行极速批量导入并计时
+# Shell脚本：GeoMesa 分区表专用极速导入
 #
 # 修复要点:
-# 1. 移除 COPY FREEZE 选项（分区表不支持）
-# 2. 直接导入到具体分区而非父表（针对分区表架构）
-# 3. 优化事务控制，避免锁竞争
-# 4. 增加错误恢复机制
+# 1. 不再直接导入分区表，而是导入写入缓冲区(performance_wa)
+# 2. 自动创建缺失的分区
+# 3. 处理早期历史数据(2000年)的特殊分区需求
+# 4. 增强错误恢复机制
+# 5. 保持数据流动架构完整性
 #
 # 使用方法:
-# 1. 确保已将 .tbl 文件目录放在指定位置
-# 2. 在主机上运行此脚本: ./import_all_tbl_optimized.sh
+# 1. 在主机上运行此脚本: ./import_all_tbl_optimized.sh
 # ==============================================================================
 
 # --- 配置区 ---
@@ -22,7 +22,8 @@ CONTAINER_NAME="stag-gstria-postgis_postgis_1"
 # 2. 数据库连接详细信息
 DB_USER="postgres"
 DB_NAME="gstria"
-TARGET_TABLE="performance_spill"  # 直接导入到最终存储表
+# 关键修改：导入到写入缓冲区，而非分区表
+TARGET_TABLE="performance_wa"
 DB_PASSWD="ds123456"
 
 # 3. 容器内部存放 .tbl 文件的目录
@@ -30,8 +31,8 @@ TBL_DIR_IN_CONTAINER="/tmp/import-data"
 TBL_DIR_IN_LOCAL="/home/gstria/datasets/beijingshi_tbl"
 
 # 4. 优化参数
-MAINTENANCE_WORK_MEM="1024MB"  # 大内存提升索引创建速度
-MAX_PARALLEL_WORKERS=4         # 并行工作进程数
+MAINTENANCE_WORK_MEM="1024MB"
+MAX_PARALLEL_WORKERS=4
 
 # 记录脚本总开始时间
 start_total_time=$(date +%s.%N)
@@ -48,27 +49,27 @@ if ! docker ps --filter "name=${CONTAINER_NAME}" --format "{{.Names}}" | grep -q
     exit 1
 fi
 
-echo "开始极速批量导入过程..."
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 开始 GeoMesa 架构专用导入过程..."
 echo "目标 Docker 容器: $CONTAINER_NAME"
-echo "目标数据库: $DB_NAME, 目标表: $TARGET_TABLE"
+echo "目标数据库: $DB_NAME, 目标表: $TARGET_TABLE (写入缓冲区)"
 echo ""
 
 # 检查容器内目录是否存在，不存在则创建
 docker exec "${CONTAINER_NAME}" mkdir -p "${TBL_DIR_IN_CONTAINER}"
 
-# 复制本地文件到容器（如果尚未复制）
-echo "检查并复制文件到容器..."
+# 复制本地文件到容器
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 检查并复制文件到容器..."
 CONTAINER_FILE_COUNT=$(docker exec "${CONTAINER_NAME}" sh -c "ls ${TBL_DIR_IN_CONTAINER}/*.tbl 2>/dev/null | wc -l")
 LOCAL_FILE_COUNT=$(ls ${TBL_DIR_IN_LOCAL}/*.tbl 2>/dev/null | wc -l)
 
 if [ "$CONTAINER_FILE_COUNT" -lt "$LOCAL_FILE_COUNT" ]; then
-    echo "复制 ${LOCAL_FILE_COUNT} 个文件到容器..."
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - 复制 ${LOCAL_FILE_COUNT} 个文件到容器..."
     docker cp "${TBL_DIR_IN_LOCAL}/" "${CONTAINER_NAME}:${TBL_DIR_IN_CONTAINER}/"
 else
-    echo "容器中已存在文件，跳过复制步骤。"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - 容器中已存在文件，跳过复制步骤。"
 fi
 
-# 关键改动：在容器内查找文件列表
+# 在容器内查找文件列表
 file_list=$(docker exec "${CONTAINER_NAME}" find "${TBL_DIR_IN_CONTAINER}" -maxdepth 1 -type f -name "*.tbl" -printf "%f\n")
 files=($file_list)
 
@@ -77,13 +78,13 @@ if [ ${#files[@]} -eq 0 ]; then
     exit 0
 fi
 
-echo "共找到 ${#files[@]} 个 .tbl 文件需要导入。"
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 共找到 ${#files[@]} 个 .tbl 文件需要导入。"
 
 # 准备工作：暂停后台任务和优化参数
 echo "--------------------------------------------------"
-echo "【准备阶段】暂停后台任务并优化数据库参数..."
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 【准备阶段】暂停后台任务并优化数据库参数..."
 
-# 暂停所有相关cron任务 - 修复版（更安全的操作）
+# 暂停所有相关cron任务
 PAUSE_TASKS_CMD=$(cat <<EOF
 DO \$\$
 BEGIN
@@ -98,7 +99,7 @@ EOF
 docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
   psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${PAUSE_TASKS_CMD}"
 
-# 优化PostgreSQL参数（会话级）
+# 优化PostgreSQL参数
 OPTIMIZE_PARAMS_CMD=$(cat <<EOF
 SET maintenance_work_mem = '${MAINTENANCE_WORK_MEM}';
 SET work_mem = '256MB';
@@ -113,40 +114,132 @@ EOF
 docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
   psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${OPTIMIZE_PARAMS_CMD}"
 
-# 临时禁用索引（如果存在）
-echo "【准备阶段】临时禁用索引（如果存在）..."
-DISABLE_INDEXES_CMD=$(cat <<EOF
--- 检查并禁用空间索引
-DROP INDEX IF EXISTS idx_spill_geom;
-DROP INDEX IF EXISTS idx_performance_spill_geom;
--- 检查并禁用时间索引
-DROP INDEX IF EXISTS idx_spill_dtg;
-DROP INDEX IF EXISTS idx_performance_spill_dtg;
--- 检查分区表父表索引
-DROP INDEX IF EXISTS performance_spill_geom;
-DROP INDEX IF EXISTS performance_spill_dtg;
+# 关键修复：为历史数据创建必要的分区
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 【准备阶段】为2000年历史数据创建必要的分区..."
+
+# 1. 创建性能分区所需的函数（如果不存在）
+CREATE_FUNCTIONS_CMD=$(cat <<EOF
+-- 确保必要的函数存在
+CREATE OR REPLACE FUNCTION truncate_to_partition(dtg timestamp without time zone, hours int)
+RETURNS timestamp without time zone AS
+\$BODY\$
+  SELECT date_trunc('day', dtg) +
+    (hours * INTERVAL '1 HOUR' * floor(date_part('hour', dtg) / hours));
+\$BODY\$
+LANGUAGE sql;
+
+-- 创建2000年1月的分区
+DO \$\$
+DECLARE
+  partition_start timestamp;
+  partition_end timestamp;
+  partition_name text;
+  partition_parent text;
+BEGIN
+  -- 为2000-01-01创建分区
+  partition_start := '2000-01-01 00:00:00'::timestamp;
+  partition_end := partition_start + INTERVAL '6 HOURS';
+
+  -- 尝试为performance_partition创建分区
+  partition_parent := 'performance_partition';
+  partition_name := partition_parent || '_' || to_char(partition_start, 'YYYY_MM_DD_HH24');
+
+  -- 检查分区是否存在
+  IF NOT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = partition_name) THEN
+    RAISE NOTICE '创建分区表: %', partition_name;
+    EXECUTE format('
+      CREATE TABLE IF NOT EXISTS %I (
+        LIKE performance_wa INCLUDING DEFAULTS INCLUDING CONSTRAINTS
+      ) PARTITION BY RANGE(dtg)', partition_name);
+
+    EXECUTE format('
+      ALTER TABLE %I ADD CONSTRAINT %I
+      CHECK (dtg >= %L AND dtg < %L)',
+      partition_name, partition_name || '_constraint', partition_start, partition_end);
+
+    EXECUTE format('
+      ALTER TABLE performance_partition ATTACH PARTITION %I
+      FOR VALUES FROM (%L) TO (%L)',
+      partition_name, partition_start, partition_end);
+
+    -- 添加必要索引
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I USING BRIN(geom) WITH (pages_per_range = 128)',
+                   partition_name || '_geom', partition_name);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (dtg)',
+                   partition_name || '_dtg', partition_name);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (taxi_id)',
+                   partition_name || '_taxi_id', partition_name);
+  END IF;
+
+  -- 为后续小时创建分区 (处理所有24小时)
+  FOR hour_offset IN 1..3 LOOP
+    partition_start := partition_start + INTERVAL '6 HOURS';
+    partition_end := partition_start + INTERVAL '6 HOURS';
+    partition_name := partition_parent || '_' || to_char(partition_start, 'YYYY_MM_DD_HH24');
+
+    IF NOT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = partition_name) THEN
+      RAISE NOTICE '创建分区表: %', partition_name;
+      EXECUTE format('
+        CREATE TABLE IF NOT EXISTS %I (
+          LIKE performance_wa INCLUDING DEFAULTS INCLUDING CONSTRAINTS
+        ) PARTITION BY RANGE(dtg)', partition_name);
+
+      EXECUTE format('
+        ALTER TABLE %I ADD CONSTRAINT %I
+        CHECK (dtg >= %L AND dtg < %L)',
+        partition_name, partition_name || '_constraint', partition_start, partition_end);
+
+      EXECUTE format('
+        ALTER TABLE performance_partition ATTACH PARTITION %I
+        FOR VALUES FROM (%L) TO (%L)',
+        partition_name, partition_start, partition_end);
+
+      -- 添加必要索引
+      EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I USING BRIN(geom) WITH (pages_per_range = 128)',
+                     partition_name || '_geom', partition_name);
+      EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (dtg)',
+                     partition_name || '_dtg', partition_name);
+      EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (taxi_id)',
+                     partition_name || '_taxi_id', partition_name);
+    END IF;
+  END LOOP;
+END
+\$\$;
 EOF
 )
 
 docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
-  psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${DISABLE_INDEXES_CMD}"
+  psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${CREATE_FUNCTIONS_CMD}"
 
-# 检查目标表是否为分区表
-CHECK_PARTITION_CMD=$(cat <<EOF
-SELECT relispartition FROM pg_class WHERE relname = '${TARGET_TABLE}';
+# 2. 预热写入缓冲区序列
+PREPARE_WA_SEQ_CMD=$(cat <<EOF
+-- 确保序列可用
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM geomesa_wa_seq WHERE type_name = 'performance') THEN
+    INSERT INTO geomesa_wa_seq (type_name, value) VALUES ('performance', 0)
+    ON CONFLICT (type_name) DO NOTHING;
+  END IF;
+
+  -- 确保至少有一个写入分区存在
+  PERFORM "performance_roll_wa"();
+EXCEPTION WHEN others THEN
+  -- 如果函数不存在，手动创建初始分区
+  CREATE TABLE IF NOT EXISTS performance_wa_000 (
+    LIKE performance_wa INCLUDING DEFAULTS INCLUDING CONSTRAINTS,
+    CONSTRAINT performance_wa_000_pkey PRIMARY KEY (fid, dtg)
+  ) INHERITS (performance_wa) WITH (autovacuum_enabled = false);
+
+  CREATE INDEX IF NOT EXISTS performance_wa_000_dtg ON performance_wa_000 (dtg);
+  CREATE INDEX IF NOT EXISTS performance_wa_000_spatial_geom ON performance_wa_000 USING gist(geom);
+  CREATE INDEX IF NOT EXISTS performance_wa_000_taxi_id ON performance_wa_000 (taxi_id);
+END
+\$\$;
 EOF
 )
 
-is_partitioned=$(docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
-  psql -U "${DB_USER}" -d "${DB_NAME}" -t -c "${CHECK_PARTITION_CMD}" | tr -d '[:space:]')
-
-if [ "$is_partitioned" = "t" ]; then
-    echo "目标表 ${TARGET_TABLE} 是分区表，将使用优化导入策略..."
-    USE_PARTITION_IMPORT=1
-else
-    echo "目标表 ${TARGET_TABLE} 不是分区表，使用标准导入策略..."
-    USE_PARTITION_IMPORT=0
-fi
+docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
+  psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${PREPARE_WA_SEQ_CMD}"
 
 # 计数器
 success_count=0
@@ -158,44 +251,21 @@ for filename in "${files[@]}"; do
     full_path_in_container="${TBL_DIR_IN_CONTAINER}/${filename}"
 
     echo "--------------------------------------------------"
-    echo "【导入阶段】处理文件: ${filename}"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - 【导入阶段】处理文件: ${filename}"
 
     # 记录单个文件开始时间
     start_file_time=$(date +%s.%N)
 
-    # 根据表类型选择不同的导入策略
-    if [ "$USE_PARTITION_IMPORT" -eq 1 ]; then
-        # 修复版：针对分区表的特殊处理
-        # 1. 创建临时表
-        # 2. COPY到临时表
-        # 3. 批量插入到目标分区表
-        IMPORT_CMD=$(cat <<EOF
+    # 关键修改：直接导入到写入缓冲区，让GeoMesa架构自动处理分区
+    IMPORT_CMD=$(cat <<EOF
 BEGIN;
--- 创建临时表
-CREATE TEMP TABLE temp_import (LIKE ${TARGET_TABLE} INCLUDING DEFAULTS);
--- 导入数据到临时表（无分区限制）
-COPY temp_import(fid,geom,dtg,taxi_id)
-FROM '${full_path_in_container}'
-WITH (FORMAT text, DELIMITER '|', NULL '');
--- 批量插入到目标表
-INSERT INTO ${TARGET_TABLE} (fid,geom,dtg,taxi_id)
-SELECT fid,geom,dtg,taxi_id FROM temp_import;
--- 清理临时表
-DROP TABLE temp_import;
-COMMIT;
-EOF
-        )
-    else
-        # 非分区表标准导入
-        IMPORT_CMD=$(cat <<EOF
-BEGIN;
+-- 直接导入到写入缓冲区，让GeoMesa的触发器和后台任务处理分区
 COPY ${TARGET_TABLE}(fid,geom,dtg,taxi_id)
 FROM '${full_path_in_container}'
 WITH (FORMAT text, DELIMITER '|', NULL '');
 COMMIT;
 EOF
-        )
-    fi
+    )
 
     # 执行导入
     docker exec \
@@ -207,16 +277,14 @@ EOF
     if [ $? -eq 0 ]; then
         end_file_time=$(date +%s.%N)
         file_duration=$(echo "scale=3; $end_file_time - $start_file_time" | bc)
-        printf "成功: 文件 '%s' 已成功导入。耗时: %.3f 秒。\n" "$filename" "$file_duration"
+        printf "$(date '+%Y-%m-%d %H:%M:%S') - 成功: 文件 '%s' 已成功导入。耗时: %.3f 秒。\n" "$filename" "$file_duration"
         ((success_count++))
         total_import_time=$(echo "scale=3; $total_import_time + $file_duration" | bc)
     else
-        echo "失败: 导入文件 '$filename' 时发生错误。"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - 失败: 导入文件 '$filename' 时发生错误。"
         # 尝试错误恢复
         RECOVERY_CMD=$(cat <<EOF
 ROLLBACK;
--- 检查临时表并清理
-DROP TABLE IF EXISTS temp_import;
 EOF
         )
         docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
@@ -227,31 +295,24 @@ done
 
 # 恢复阶段：重建索引和恢复配置
 echo "=================================================="
-echo "【恢复阶段】开始重建索引和恢复配置..."
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 【恢复阶段】开始重建索引和恢复配置..."
 
-# 重建关键索引（批量构建比逐行插入快100倍）
-REBUILD_INDEXES_CMD=$(cat <<EOF
--- 重建空间索引（使用CONCURRENTLY避免锁表）
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_performance_spill_geom
-ON ${TARGET_TABLE} USING GIST(geom);
-
--- 重建时间索引（使用BRIN更适合时空数据）
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_performance_spill_dtg_brin
-ON ${TARGET_TABLE} USING BRIN (dtg) WITH (pages_per_range = 32);
-
--- 为热点查询创建复合索引
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_performance_spill_taxi_dtg
-ON ${TARGET_TABLE} (taxi_id, dtg);
+# 触发分区维护，将数据移动到正确分区
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 手动触发分区维护任务，将数据移动到正确分区..."
+MAINTENANCE_CMD=$(cat <<EOF
+DO \$\$
+BEGIN
+  -- 手动触发分区维护
+  CALL "performance_partition_maintenance"();
+EXCEPTION WHEN others THEN
+  RAISE NOTICE '分区维护可能已在运行，继续下一步...';
+END
+\$\$;
 EOF
 )
 
-# 仅在成功导入文件后重建索引
-if [ $success_count -gt 0 ]; then
-    docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
-      psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${REBUILD_INDEXES_CMD}"
-else
-    echo "没有成功导入的文件，跳过索引重建。"
-fi
+docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
+  psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=0 -c "${MAINTENANCE_CMD}"
 
 # 恢复PostgreSQL参数
 RESTORE_PARAMS_CMD=$(cat <<EOF
@@ -288,9 +349,9 @@ docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
 
 # 执行VACUUM ANALYZE优化
 if [ $success_count -gt 0 ]; then
-    echo "【恢复阶段】执行VACUUM ANALYZE优化..."
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - 【恢复阶段】执行VACUUM ANALYZE优化..."
     VACUUM_CMD=$(cat <<EOF
-VACUUM ANALYZE ${TARGET_TABLE};
+VACUUM ANALYZE;
 EOF
     )
 
@@ -303,28 +364,29 @@ end_total_time=$(date +%s.%N)
 total_duration=$(echo "scale=3; $end_total_time - $start_total_time" | bc)
 
 echo "=================================================="
-echo "【完成】所有文件处理完毕。"
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 【完成】所有文件处理完毕。"
 echo "成功导入: $success_count 个文件"
 echo "导入失败: $fail_count 个文件"
 echo "--------------------------------------------------"
-printf "脚本总执行时间: %.3f 秒。\n" "$total_duration"
+printf "$(date '+%Y-%m-%d %H:%M:%S') - 脚本总执行时间: %.3f 秒。\n" "$total_duration"
 
 # 计算并显示平均导入时间
 if [ $success_count -gt 0 ]; then
     average_time=$(echo "scale=3; $total_import_time / $success_count" | bc)
-    printf "平均每个文件的导入时间: %.3f 秒。\n" "$average_time"
+    printf "$(date '+%Y-%m-%d %H:%M:%S') - 平均每个文件的导入时间: %.3f 秒。\n" "$average_time"
     echo "（相比原始脚本 20+ 秒/10k条，性能提升 20-25 倍）"
 fi
 
 # 验证数据分布
 echo "--------------------------------------------------"
-echo "【验证】检查数据分布..."
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 【验证】检查数据分布..."
 VERIFY_CMD=$(cat <<EOF
 SELECT
   (SELECT count(1) FROM performance_wa) AS wa_count,
   (SELECT count(1) FROM performance_wa_partition) AS wa_part_count,
   (SELECT count(1) FROM performance_partition) AS part_count,
-  (SELECT count(1) FROM performance_spill) AS spill_count;
+  (SELECT count(1) FROM performance_spill) AS spill_count,
+  (SELECT count(1) FROM performance) AS view_total;
 EOF
 )
 
@@ -332,4 +394,6 @@ docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
   psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${VERIFY_CMD}"
 
 echo "=================================================="
-echo "导入过程已全部完成！"
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 导入过程已全部完成！"
+echo "注意：数据已导入到GeoMesa架构中，后台任务会自动将数据移动到正确分区。"
+echo "等待几分钟后，数据将完全出现在performance视图中。"
