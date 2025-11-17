@@ -323,3 +323,268 @@ for i in "${!files[@]}"; do
                 "$success_count" "$fail_count"
         fi
     else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - 失败: 导入文件 '$filename' 时发生错误。"
+        echo "$filename" >> "$FAILED_FILES_LOG"
+        ((fail_count++))
+        ((processed_files++))
+    fi
+
+    # 检查是否达到批处理限制
+    batch_end_time=$(date +%s.%N)
+    current_batch_duration=$(echo "scale=3; $batch_end_time - $batch_start_time" | bc)
+
+    should_commit=false
+
+    # 条件1: 达到批大小
+    if [ $batch_counter -ge $BATCH_SIZE ]; then
+        should_commit=true
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - 【批处理】达到批大小限制 ($BATCH_SIZE 个文件)"
+    fi
+
+    # 条件2: 达到时间限制
+    if [ $(echo "$current_batch_duration > $MAX_BATCH_DURATION" | bc) -eq 1 ]; then
+        should_commit=true
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - 【批处理】达到时间限制 ($MAX_BATCH_DURATION 秒)"
+    fi
+
+    # 条件3: 最后一个文件
+    if [ $processed_files -eq ${#files[@]} ]; then
+        should_commit=true
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - 【批处理】处理完所有文件"
+    fi
+
+    # 提交批处理
+    if [ "$should_commit" = true ] && [ $batch_counter -gt 0 ]; then
+        COMMIT_CMD="COMMIT;"
+        commit_start_time=$(date +%s.%N)
+
+        docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
+          psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${COMMIT_CMD}"
+
+        commit_end_time=$(date +%s.%N)
+        commit_duration=$(echo "scale=3; $commit_end_time - $commit_start_time" | bc)
+
+        batch_end_time=$(date +%s.%N)
+        batch_duration=$(echo "scale=3; $batch_end_time - $batch_start_time" | bc)
+        avg_per_file=$(echo "scale=3; $batch_duration / $batch_counter" | bc)
+        batch_rows=$((batch_counter * 10000))
+        throughput=$(echo "scale=0; $batch_rows / $batch_duration" | bc)
+
+        # 更新最佳/最差吞吐量
+        if [ "$throughput" -gt "$best_throughput" ]; then
+            best_throughput=$throughput
+        fi
+        if [ "$throughput" -lt "$worst_throughput" ]; then
+            worst_throughput=$throughput
+        fi
+
+        printf "$(date '+%Y-%m-%d %H:%M:%S') - 【批处理】完成批次: %2d个文件, 耗时: %6.2fs, 平均: %5.3fs/文件, 吞吐量: %6d条/秒, 提交耗时: %5.2fs\n" \
+            "$batch_counter" "$batch_duration" "$avg_per_file" "$throughput" "$commit_duration"
+
+        # 保存进度
+        echo "$processed_files" > "$PROGRESS_FILE"
+
+        # 自适应批大小调整
+        if [ "$ADAPTIVE_BATCHING" = true ]; then
+            if [ "$throughput" -gt 25000 ]; then
+                # 性能良好，增大批次
+                new_batch_size=$((BATCH_SIZE * 12 / 10))
+                if [ "$new_batch_size" -le 500 ]; then
+                    BATCH_SIZE=$new_batch_size
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - 【自适应】吞吐量高，增大批大小至 $BATCH_SIZE"
+                fi
+            elif [ "$throughput" -lt 10000 ]; then
+                # 性能不佳，减小批次
+                new_batch_size=$((BATCH_SIZE * 8 / 10))
+                if [ "$new_batch_size" -ge 10 ]; then
+                    BATCH_SIZE=$new_batch_size
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - 【自适应】吞吐量低，减小批大小至 $BATCH_SIZE"
+                fi
+            fi
+        fi
+
+        # 重置批计数器
+        batch_counter=0
+
+        # 每5个批次执行一次VACUUM ANALYZE
+        if [ $((processed_files / BATCH_SIZE)) % 5 -eq 0 ] && [ $processed_files -gt 0 ]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 【维护】执行VACUUM ANALYZE优化..."
+            VACUUM_CMD="VACUUM ANALYZE ${TARGET_TABLE};"
+
+            docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
+              psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${VACUUM_CMD}"
+        fi
+
+        # 检查磁盘空间
+        DISK_USAGE_CMD="SELECT pg_size_pretty(pg_database_size('${DB_NAME}')) AS db_size;"
+        db_size=$(docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
+          psql -U "${DB_USER}" -d "${DB_NAME}" -t -c "$DISK_USAGE_CMD" | tr -d '[:space:]')
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - 【监控】当前数据库大小: $db_size"
+
+        # 开始新事务
+        if [ $processed_files -lt ${#files[@]} ]; then
+            BEGIN_CMD="BEGIN;"
+            docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
+              psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${BEGIN_CMD}"
+        fi
+    fi
+done
+
+# 确保最后的事务被提交
+if [ $batch_counter -gt 0 ]; then
+    COMMIT_CMD="COMMIT;"
+    docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
+      psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${COMMIT_CMD}"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - 【清理】提交最后一个批次事务"
+fi
+
+# 恢复阶段：重建索引和恢复配置
+echo "=================================================="
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 【恢复阶段】开始重建索引和恢复配置..."
+
+# 1. 执行最终VACUUM ANALYZE
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 执行最终VACUUM ANALYZE优化..."
+VACUUM_CMD="VACUUM ANALYZE;"
+docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
+  psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${VACUUM_CMD}"
+
+# 2. 手动触发分区维护
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 手动触发分区维护任务，将数据移动到正确分区..."
+MAINTENANCE_CMD=$(cat <<EOF
+DO \$\$
+BEGIN
+  -- 手动触发分区维护
+  CALL "performance_partition_maintenance"();
+EXCEPTION WHEN others THEN
+  RAISE NOTICE '分区维护执行: %', SQLERRM;
+END
+\$\$;
+EOF
+)
+
+docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
+  psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=0 -c "${MAINTENANCE_CMD}"
+
+# 3. 恢复PostgreSQL参数
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 恢复默认PostgreSQL参数..."
+RESTORE_PARAMS_CMD=$(cat <<EOF
+RESET maintenance_work_mem;
+RESET work_mem;
+RESET max_parallel_workers_per_gather;
+RESET enable_partitionwise_join;
+RESET enable_partitionwise_aggregate;
+RESET commit_delay;
+RESET commit_siblings;
+RESET random_page_cost;
+RESET effective_io_concurrency;
+SET synchronous_commit = on;
+EOF
+)
+
+docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
+  psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${RESTORE_PARAMS_CMD}"
+
+# 4. 重新激活cron任务
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 重新激活后台任务..."
+REACTIVATE_TASKS_CMD=$(cat <<EOF
+DO \$\$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+    UPDATE cron.job SET active = true WHERE jobname LIKE 'performance%';
+    RAISE NOTICE '已激活 % 个 cron 任务', (SELECT count(*) FROM cron.job WHERE jobname LIKE 'performance%' AND active = true);
+
+    -- 手动触发分区维护
+    CALL "performance_partition_maintenance"();
+    -- 更新统计信息
+    CALL "performance_analyze_partitions"();
+  END IF;
+END
+\$\$;
+EOF
+)
+
+docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
+  psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${REACTIVATE_TASKS_CMD}"
+
+# 记录脚本总结束时间
+end_total_time=$(date +%s.%N)
+total_duration=$(echo "scale=3; $end_total_time - $start_total_time" | bc)
+hours=$(echo "scale=0; $total_duration / 3600" | bc)
+minutes=$(echo "scale=0; ($total_duration - $hours * 3600) / 60" | bc)
+seconds=$(echo "scale=0; $total_duration - $hours * 3600 - $minutes * 60" | bc)
+
+echo "=================================================="
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 【完成】所有文件处理完毕。"
+echo "成功导入: $success_count 个文件"
+echo "导入失败: $fail_count 个文件"
+echo "--------------------------------------------------"
+printf "$(date '+%Y-%m-%d %H:%M:%S') - 脚本总执行时间: %d小时 %d分钟 %d秒 (%.0f秒)\n" "$hours" "$minutes" "$seconds" "$total_duration"
+
+# 计算并显示性能指标
+if [ $success_count -gt 0 ]; then
+    average_time_per_file=$(echo "scale=3; $total_duration / $success_count" | bc)
+    total_rows=$((success_count * 10000))
+    overall_throughput=$(echo "scale=0; $total_rows / $total_duration" | bc)
+
+    printf "$(date '+%Y-%m-%d %H:%M:%S') - 平均每个文件的处理时间: %.3f 秒\n" "$average_time_per_file"
+    printf "$(date '+%Y-%m-%d %H:%M:%S') - 总吞吐量: %d 条/秒\n" "$overall_throughput"
+    printf "$(date '+%Y-%m-%d %H:%M:%S') - 最佳批次吞吐量: %d 条/秒\n" "$best_throughput"
+    printf "$(date '+%Y-%m-%d %H:%M:%S') - 最差批次吞吐量: %d 条/秒\n" "$worst_throughput"
+
+    # 估算总时间
+    estimated_total_time=$(echo "scale=0; (${#files[@]} * $average_time_per_file)" | bc)
+    est_hours=$(echo "scale=0; $estimated_total_time / 3600" | bc)
+    est_minutes=$(echo "scale=0; ($estimated_total_time - $est_hours * 3600) / 60" | bc)
+    est_seconds=$(echo "scale=0; $estimated_total_time - $est_hours * 3600 - $est_minutes * 60" | bc)
+
+    if [ $processed_files -lt ${#files[@]} ]; then
+        printf "$(date '+%Y-%m-%d %H:%M:%S') - 估算剩余完成时间: %d小时 %d分钟 %d秒\n" "$est_hours" "$est_minutes" "$est_seconds"
+    fi
+fi
+
+# 验证数据分布
+echo "--------------------------------------------------"
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 【验证】检查数据分布..."
+VERIFY_CMD=$(cat <<EOF
+SELECT
+  (SELECT count(1)::text FROM performance_wa) AS wa_count,
+  (SELECT count(1)::text FROM performance_wa_partition) AS wa_part_count,
+  (SELECT count(1)::text FROM performance_partition) AS part_count,
+  (SELECT count(1)::text FROM performance_spill) AS spill_count,
+  (SELECT count(1)::text FROM performance) AS view_total;
+EOF
+)
+
+result=$(docker exec -e PGPASSWORD="${DB_PASSWD}" "${CONTAINER_NAME}" \
+  psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -t -c "${VERIFY_CMD}" 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - 数据分布结果:"
+    echo "$result" | while read -r line; do
+        echo "  $line"
+    done
+else
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - 警告: 无法获取数据分布统计"
+fi
+
+# 显示失败文件摘要
+if [ $fail_count -gt 0 ]; then
+    echo "--------------------------------------------------"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - 【失败文件摘要】共 $fail_count 个文件导入失败:"
+    echo "可以查看详细日志: $FAILED_FILES_LOG"
+    echo "重新运行脚本将自动跳过已成功处理的文件"
+fi
+
+echo "=================================================="
+echo "$(date '+%Y-%m-%d %H:%M:%S') - 导入过程已全部完成！"
+echo "注意: 数据已导入到GeoMesa架构中，后台任务会自动将数据移动到正确分区。"
+echo "通常在10-20分钟后，所有数据将完全出现在performance视图中。"
+echo "=================================================="
+
+# 清理临时文件
+if [ $success_count -ge ${#files[@]} ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - 【清理】所有文件导入成功，清理进度文件..."
+    docker exec "${CONTAINER_NAME}" rm -f "$PROGRESS_FILE" "$FAILED_FILES_LOG"
+fi
+
+exit 0
