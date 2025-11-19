@@ -74,12 +74,16 @@ for i in "${!files[@]}"; do
     # [MODIFIED] 重新加入 -q 标志，并将 stderr 重定向到一个临时文件以捕获错误
     psql_error_log=$(mktemp)
 
+    $import_start_time=$(date +%s.%N)
+
     cat "${local_full_path}" | docker exec -i "${CONTAINER_NAME}" \
       psql -U "${DB_USER}" -d "${DB_NAME}" -q -v ON_ERROR_STOP=1 \
       -c "COPY ${TARGET_TABLE}(fid,geom,dtg,taxi_id) FROM STDIN WITH (FORMAT text, DELIMITER '|', NULL '');" 2> "${psql_error_log}"
     exit_code=$?
 
     import_end_time=$(date +%s.%N)
+
+    echo "${import_end_time} --- ${$import_start_time}"
 
     if [ "$exit_code" -eq 0 ]; then
         import_duration=$(echo "scale=3; $import_end_time - $import_start_time" | bc)
