@@ -15,8 +15,8 @@ ROWS_PER_FILE = 100000
 
 # 辅助脚本路径（基于当前脚本所在目录）
 SCRIPT_DIR = Path(__file__).parent.resolve()
-DISABLE_SCRIPT = SCRIPT_DIR / "disable_geomesa_features.sh"
-ENABLE_SCRIPT = SCRIPT_DIR / "enable_geomesa_features.sh"
+DISABLE_SCRIPT = SCRIPT_DIR.parent / "bin" / "disable_geomesa_features.sh"
+ENABLE_SCRIPT = SCRIPT_DIR.parent / "bin" / "enable_geomesa_features.sh"
 
 # ==================== 工具函数 ====================
 def run_command(cmd, check=True, capture_output=False):
