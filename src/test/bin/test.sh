@@ -12,8 +12,8 @@ TBL_DIR_IN_LOCAL="/data6/zhangdw/datasets/beijingshi_tbl_100k"
 
 FIL_NAME="merged_0.tbl"
 
-gzip -k "${TBL_DIR_IN_LOCAL}/${FIL_NAME}"
 
-time (gunzip -c "${TBL_DIR_IN_LOCAL}/${FIL_NAME}.gz" | docker exec -i "${CONTAINER_NAME}" \
-  psql -U postgres -e \
-  "COPY ${TARGET_TABLE}(fid,geom,dtg,taxi_id) FROM STDIN WITH (FORMAT text, DELIMITER '|', NULL '');")
+cat -c "${TBL_DIR_IN_LOCAL}/${FIL_NAME}" | \
+  time (docker exec -i "${CONTAINER_NAME}" \
+    psql -U postgres -e \
+    "COPY ${TARGET_TABLE}(fid,geom,dtg,taxi_id) FROM STDIN WITH (FORMAT text, DELIMITER '|', NULL '');")
