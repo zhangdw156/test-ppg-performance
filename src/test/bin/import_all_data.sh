@@ -75,7 +75,7 @@ for i in "${!files[@]}"; do
     IMPORT_SQL="COPY ${TARGET_TABLE}(fid,geom,dtg,taxi_id) FROM '${container_temp_path}' WITH (FORMAT text, DELIMITER '|', NULL '');"
 
     # 执行导入，并将返回值保存
-    docker exec -i "${CONTAINER_NAME}" psql -U "${DB_USER}" -d "${DB_NAME}" -q -v ON_ERROR_STOP=1 -c "${IMPORT_SQL}" > /dev/null 2>&1
+    docker exec -i "${CONTAINER_NAME}" psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -c "${IMPORT_SQL}"
     exit_code=$?
 
     copy_end_time=$(date +%s.%N)
