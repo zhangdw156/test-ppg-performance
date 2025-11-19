@@ -103,7 +103,7 @@ echo "所有文件导入尝试完毕。"
 echo -e "\n>>> 阶段 5: 恢复 GeoMesa 特性..."
 bash "${ENABLE_SCRIPT}"
 
-# 6. 最终验证和性能报告
+# 6. 最终验证和性能报告 [MODIFIED]
 echo -e "\n>>> 阶段 6: 生成最终报告..."
 echo "=================================================="
 echo " 全量数据导入完成 - 性能报告"
@@ -116,11 +116,21 @@ echo "  - 失败导入文件数: ${fail_count}"
 echo "  - 文件总数: ${total_files}"
 echo "--------------------------------------------------"
 
+# [MODIFIED] 增加安全检查
 if [ "$success_count" -gt 0 ]; then
     total_rows_imported=$((success_count * ROWS_PER_FILE))
     avg_time_per_file=$(echo "scale=3; $total_import_duration / $success_count" | bc)
-    overall_throughput=$(echo "scale=0; $total_rows_imported / $total_import_duration" | bc 2>/dev/null || echo "0")
-    avg_ms_per_row=$(echo "scale=3; ($total_import_duration * 1000) / $total_rows_imported" | bc 2>/dev/null || echo "0")
+
+    # 安全地计算吞吐量
+    overall_throughput=0
+    # 使用 awk 来比较浮点数，检查总耗时是否大于0
+    if (( $(echo "$total_import_duration > 0" | bc -l) )); then
+        overall_throughput=$(echo "scale=0; $total_rows_imported / $total_import_duration" | bc)
+        avg_ms_per_row=$(echo "scale=3; ($total_import_duration * 1000) / $total_rows_imported" | bc)
+    else
+        # 如果总耗时为0或接近0，无法计算有意义的吞吐量
+        avg_ms_per_row="0.000"
+    fi
 
     echo "性能指标 (仅计算导入命令耗时):"
     printf "  - 纯数据导入总耗时: %.3f 秒\n" "$total_import_duration"
