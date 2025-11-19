@@ -13,7 +13,7 @@ TBL_DIR_IN_LOCAL="/data6/zhangdw/datasets/beijingshi_tbl_100k"
 FIL_NAME="merged_0.tbl"
 
 
-cat -c "${TBL_DIR_IN_LOCAL}/${FIL_NAME}" | \
-  time (docker exec -i "${CONTAINER_NAME}" \
+time (cat -c "${TBL_DIR_IN_LOCAL}/${FIL_NAME}" | \
+  docker exec -i "${CONTAINER_NAME}" \
     psql -U postgres -e \
     "COPY ${TARGET_TABLE}(fid,geom,dtg,taxi_id) FROM STDIN WITH (FORMAT text, DELIMITER '|', NULL '');")
