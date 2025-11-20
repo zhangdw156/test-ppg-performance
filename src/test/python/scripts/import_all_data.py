@@ -28,17 +28,13 @@ logging.basicConfig(
 CONTAINER_NAME = "my-postgis-container"
 DB_USER = "postgres"
 DB_NAME = "postgres"
-
 TARGET_TABLE_BASE = "performance"
-
 TBL_DIR_IN_LOCAL = Path("/data6/zhangdw/datasets/beijingshi_tbl_100k")
 ROWS_PER_FILE = 100000
 
 # ==================== 工具函数 ====================
 def run_command(cmd, check=True, capture_output=False):
-    """
-    执行 shell 命令。
-    """
+    """执行简单 shell 命令"""
     try:
         result = subprocess.run(
             cmd,
@@ -54,13 +50,13 @@ def run_command(cmd, check=True, capture_output=False):
             logging.error(f"错误输出: {e.stderr.strip()}")
         raise e
 
-# ==================== 核心导入函数 ====================
+# ==================== 核心导入函数 (重大修改) ====================
 def import_single_file_with_lock(file_path):
     """
-    使用包含锁和动态分区名的事务来导入单个文件。
+    使用 Python Popen 流式传输数据，精确控制换行符，避免 'literal newline' 错误。
     """
 
-    # --- 步骤 1: 查询数据库，获取当前活动的、格式化好的分区表名 ---
+    # --- 步骤 1: 获取动态分区表名 (保持不变) ---
     get_partition_sql = (
         f"SELECT '\"{TARGET_TABLE_BASE}_wa_' || lpad(value::text, 3, '0') || '\"' "
         f"FROM \"public\".\"geomesa_wa_seq\" WHERE type_name = '{TARGET_TABLE_BASE}'"
@@ -74,52 +70,99 @@ def import_single_file_with_lock(file_path):
     try:
         result = run_command(get_partition_cmd, capture_output=True)
         partition_name = result.stdout.strip()
-
         if not partition_name:
-            raise ValueError(f"未能从 geomesa_wa_seq 获取到分区名 (type_name='{TARGET_TABLE_BASE}')")
-
+            raise ValueError(f"未能从 geomesa_wa_seq 获取分区名")
         logging.info(f"      -> 动态获取分区表名: {partition_name}")
-
-    except (subprocess.CalledProcessError, ValueError) as e:
-        logging.error(f"      -> 获取动态分区表名失败！")
-        if isinstance(e, subprocess.CalledProcessError):
-            if e.stderr: logging.error(f"      -> 错误输出: {e.stderr.strip()}")
-        else:
-            logging.error(f"      -> 错误原因: {e}")
+    except Exception as e:
+        logging.error(f"      -> 获取分区表名失败: {e}")
+        if hasattr(e, 'stderr') and e.stderr: logging.error(f"      -> details: {e.stderr.strip()}")
         return subprocess.CompletedProcess(args=get_partition_cmd, returncode=1, stderr=str(e))
 
-    # --- 步骤 2: 构建并执行包含完整事务的最终加载命令 ---
+    # --- 步骤 2: 使用 Popen 进行精确的数据管道传输 ---
+
     lock_table_name = f'"{TARGET_TABLE_BASE}_wa"'
     copy_options = "WITH (FORMAT text, DELIMITER E'|', NULL E'')"
     copy_sql = f"COPY public.{partition_name}(fid,geom,dtg,taxi_id) FROM STDIN {copy_options};"
 
-    # 使用 shlex.quote 确保文件路径安全，防止路径中有空格导致 cat 失败
-    safe_file_path = shlex.quote(str(file_path))
+    # 1. 准备 SQL 头部
+    sql_header = (
+        f"BEGIN;\n"
+        f"LOCK TABLE public.{lock_table_name} IN SHARE UPDATE EXCLUSIVE MODE;\n"
+        f"{copy_sql}\n"
+    ).encode('utf-8') # 转换为字节
 
-    final_cmd = (
-        f'({{ '
-        f'echo "BEGIN;"; '
-        f'echo \'LOCK TABLE public.{lock_table_name} IN SHARE UPDATE EXCLUSIVE MODE;\'; '
-        f'echo {shlex.quote(copy_sql)}; '
-        f'cat {safe_file_path}; '           # <--- 这里使用了 quote 后的路径
-        f'echo; echo "\\."; '
-        f'echo "COMMIT;"; '
-        f'}} ) | docker exec -i {CONTAINER_NAME} '
-        f'psql -U {DB_USER} -d {DB_NAME} -q -v ON_ERROR_STOP=1'
-    )
+    # 2. 准备 SQL 尾部 (确保 \. 单独一行)
+    sql_footer = b"\\.\nCOMMIT;\n"
 
-    return run_command(final_cmd, check=False, capture_output=True)
+    # 3. 启动 psql 进程
+    psql_cmd = f"docker exec -i {CONTAINER_NAME} psql -U {DB_USER} -d {DB_NAME} -q -v ON_ERROR_STOP=1"
+
+    proc = None
+    try:
+        # 打开进程，准备向 stdin 写入
+        proc = subprocess.Popen(
+            psql_cmd,
+            shell=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+        # A. 写入 SQL 头部
+        proc.stdin.write(sql_header)
+
+        # B. 流式写入文件内容
+        has_trailing_newline = False
+        # 使用二进制模式读取，避免编码问题，且效率更高
+        with open(file_path, 'rb') as f:
+            # 分块读取 (1MB 缓冲区)，比一次性读取省内存
+            while chunk := f.read(1024 * 1024):
+                proc.stdin.write(chunk)
+                # 检查最后一个字节是否是换行符
+                if chunk:
+                    has_trailing_newline = chunk.endswith(b'\n')
+
+        # C. 关键修正：只有当文件末尾没有换行符时，才补一个换行符
+        if not has_trailing_newline:
+            proc.stdin.write(b'\n')
+
+        # D. 写入 SQL 尾部 (\. 和 COMMIT)
+        proc.stdin.write(sql_footer)
+
+        # E. 关闭 stdin，发送 EOF 信号，并获取输出
+        stdout_bytes, stderr_bytes = proc.communicate()
+
+        # 构建返回对象
+        stdout_str = stdout_bytes.decode('utf-8', errors='replace')
+        stderr_str = stderr_bytes.decode('utf-8', errors='replace')
+
+        if proc.returncode != 0:
+            # 模拟 CalledProcessError 以便主逻辑捕获
+            raise subprocess.CalledProcessError(proc.returncode, psql_cmd, output=stdout_str, stderr=stderr_str)
+
+        return subprocess.CompletedProcess(args=psql_cmd, returncode=0, stdout=stdout_str, stderr=stderr_str)
+
+    except subprocess.CalledProcessError as e:
+        # 捕获我们自己抛出的异常
+        return subprocess.CompletedProcess(args=psql_cmd, returncode=e.returncode, stderr=e.stderr)
+    except Exception as e:
+        # 捕获 IO 错误或其他异常
+        error_msg = f"Python Popen 异常: {str(e)}"
+        logging.error(error_msg)
+        if proc:
+            proc.kill()
+        return subprocess.CompletedProcess(args=psql_cmd, returncode=1, stderr=error_msg)
 
 
 # ==================== 主逻辑 ====================
 def main():
     logging.info("=" * 50)
     start_total_time = time.time()
-    logging.info(f"开始全量数据导入流程 (带锁机制)...")
+    logging.info(f"开始全量数据导入流程 (带锁机制 - Python Popen优化版)...")
     logging.info("=" * 50)
 
     # 1. 清空目标表
-    logging.info(f"\n>>> 阶段 1: 清空主分区表 '{TARGET_TABLE_BASE}_wa' (将级联清空所有子分区)...")
+    logging.info(f"\n>>> 阶段 1: 清空主分区表 '{TARGET_TABLE_BASE}_wa'...")
     try:
         run_command(
             f"docker exec -i {CONTAINER_NAME} psql -U {DB_USER} -d {DB_NAME} -c 'TRUNCATE {TARGET_TABLE_BASE}_wa;'"
@@ -158,9 +201,6 @@ def main():
             total_import_duration += import_duration
             logging.info(f"  -> 导入文件 {i}/{total_files}: {filename} ... ✅ (耗时: {import_duration:.3f}s)")
         else:
-            # ============================================================
-            # 关键修正：在这里显式打印 SQL 错误信息
-            # ============================================================
             fail_count += 1
             logging.error(f"  -> 导入文件 {i}/{total_files}: {filename} ... ❌")
             if result.stderr:
@@ -176,7 +216,6 @@ def main():
     logging.info(f"\n>>> 阶段 4: 生成最终报告...")
     logging.info("=" * 50)
 
-    # ... (后续报告代码保持不变)
     end_total_time = time.time()
     total_script_duration = end_total_time - start_total_time
     logging.info(f"脚本总执行时间: {total_script_duration:.3f} 秒")
@@ -187,13 +226,10 @@ def main():
 
     if success_count > 0:
         total_rows_imported = success_count * ROWS_PER_FILE
-        avg_time_per_file = total_import_duration / success_count
         if total_import_duration > 0:
             overall_throughput = int(total_rows_imported / total_import_duration)
         else:
             overall_throughput = 0
-
-        logging.info("性能指标 (仅计算导入命令耗时):")
         logging.info(f"  - 纯导入吞吐量: {overall_throughput} 条/秒")
 
     logging.info("-" * 50)
