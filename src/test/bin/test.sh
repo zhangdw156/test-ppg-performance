@@ -47,6 +47,40 @@ fi
 echo "成功获取分区表名: ${PARTITION_NAME}"
 
 # ==============================================================================
+# 步骤 1.5 (新增): 删除分区表上除主键外的所有索引
+# ==============================================================================
+echo ">>> 步骤 1.5: [优化] 正在删除 ${PARTITION_NAME} 上除主键外的索引以加速导入..."
+
+# 1. 去除 PARTITION_NAME 中的双引号，用于查询系统表 (例如 "performance_wa_000" -> performance_wa_000)
+PARTITION_NAME_PURE=$(echo "${PARTITION_NAME}" | tr -d '"')
+
+# 2. 查询该表下的非主键索引名称
+# 逻辑：查询 pg_indexes，过滤掉 indexdef 包含 "PRIMARY KEY" 的记录
+GET_INDEXES_SQL="SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND tablename = '${PARTITION_NAME_PURE}' AND indexdef NOT LIKE '%PRIMARY KEY%';"
+
+INDEXES_TO_DROP=$(docker exec "${CONTAINER_NAME}" \
+  psql -U "${DB_USER}" -d "${DB_NAME}" -tA -c "${GET_INDEXES_SQL}")
+
+# 3. 循环删除索引
+if [[ -n "$INDEXES_TO_DROP" ]]; then
+    echo "发现以下辅助索引，准备删除:"
+    echo "${INDEXES_TO_DROP}"
+
+    # 设置 IFS 为换行符，防止索引名中有空格导致解析错误（虽然这里通常没有）
+    IFS=$'\n'
+    for IDX in $INDEXES_TO_DROP; do
+        echo " -> Dropping index: ${IDX} ..."
+        docker exec "${CONTAINER_NAME}" \
+          psql -U "${DB_USER}" -d "${DB_NAME}" \
+          -c "DROP INDEX IF EXISTS \"public\".\"${IDX}\";"
+    done
+    unset IFS
+    echo "辅助索引删除完毕。"
+else
+    echo "未发现需要删除的辅助索引 (可能已经被删除或仅剩主键)。"
+fi
+
+# ==============================================================================
 # 步骤 2: 构建并执行包含完整事务的最终加载命令
 # ==============================================================================
 echo ">>> 步骤 2: 开始执行数据导入事务..."
