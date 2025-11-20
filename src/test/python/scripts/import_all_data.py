@@ -43,21 +43,30 @@ ENABLE_SCRIPT = SCRIPT_DIR.parent.parent / "bin" / "enable_geomesa_features.sh"
 
 # ==================== 工具函数 ====================
 def run_command(cmd, check=True, capture_output=False):
-    """执行 shell 命令，返回结果或记录错误日志并退出"""
-    try P
-    result = subprocess.run(
-        cmd,
-        shell=True,
-        check=check,
-        capture_output=capture_output,
-        text=True
-    )
-    return result
-except subprocess.CalledProcessError as e:
-# 在主逻辑中捕获错误，这里只记录通用错误
-logging.error(f"命令执行失败: {e.cmd}")
-if capture_output:
-    logging.error(f"错误输出: {e.stderr.strip()}")
+    """
+    执行 shell 命令。
+    如果成功，返回结果。
+    如果失败，记录错误日志并重新抛出异常，让上层调用者处理。
+    """
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            check=check,
+            capture_output=capture_output,
+            text=True
+        )
+        return result
+    except subprocess.CalledProcessError as e:
+        logging.error(f"命令执行失败: {e.cmd}")
+        # 只有在捕获输出且有错误内容时才打印
+        if capture_output and e.stderr:
+            logging.error(f"错误输出: {e.stderr.strip()}")
+
+        # 重新抛出异常，这样主循环中的 try/except 逻辑才能捕获到失败
+        # 这一点至关重要，否则调用者会认为命令成功了
+        raise e
+
 # 让调用者决定是否退出
 raise e
 
