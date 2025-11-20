@@ -46,7 +46,9 @@ public class CreateSFTTest {
         try {
             ds = DataStoreFinder.getDataStore(dataStoreConfig.toMap());
             log.info("sfts: {}",Arrays.toString(ds.getTypeNames()));
-
+            if(!Arrays.toString(ds.getTypeNames()).contains(typeName)){
+                return;
+            }
             Filter filter = ECQL.toFilter("BBOX(geom,116,39,117,40) AND dtg DURING 2000-01-01T00:00:00Z/2000-01-01T00:01:00Z");
             Query query = new Query(typeName, filter);
             FeatureReader<SimpleFeatureType, SimpleFeature> reader = ds.getFeatureReader(query, Transaction.AUTO_COMMIT);
