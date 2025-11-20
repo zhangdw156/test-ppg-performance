@@ -31,21 +31,18 @@ logging.basicConfig(
 CONTAINER_NAME = "my-postgis-container"
 DB_USER = "postgres"
 DB_NAME = "postgres"
-# --- 已修改 ---
-# TARGET_TABLE 现在作为基础名称，用于查询和锁定
+
+# TARGET_TABLE_BASE 作为基础名称，用于查询 geomesa_wa_seq 和锁定主表
 TARGET_TABLE_BASE = "performance"
+
 TBL_DIR_IN_LOCAL = Path("/data6/zhangdw/datasets/beijingshi_tbl_100k")
 ROWS_PER_FILE = 100000
-
-# 辅助脚本路径
-DISABLE_SCRIPT = SCRIPT_DIR.parent.parent / "bin" / "disable_geomesa_features.sh"
-ENABLE_SCRIPT = SCRIPT_DIR.parent.parent / "bin" / "enable_geomesa_features.sh"
 
 # ==================== 工具函数 ====================
 def run_command(cmd, check=True, capture_output=False):
     """
     执行 shell 命令。
-    如果成功，返回结果。
+    如果成功，返回 result 对象。
     如果失败，记录错误日志并重新抛出异常，让上层调用者处理。
     """
     try:
@@ -58,41 +55,44 @@ def run_command(cmd, check=True, capture_output=False):
         )
         return result
     except subprocess.CalledProcessError as e:
+        # 记录命令本身的错误
         logging.error(f"命令执行失败: {e.cmd}")
-        # 只有在捕获输出且有错误内容时才打印
+        # 只有在捕获输出且有错误内容时才打印详细 stderr
         if capture_output and e.stderr:
             logging.error(f"错误输出: {e.stderr.strip()}")
 
-        # 重新抛出异常，这样主循环中的 try/except 逻辑才能捕获到失败
-        # 这一点至关重要，否则调用者会认为命令成功了
+        # 重新抛出异常，这对主逻辑捕获失败至关重要
         raise e
 
-# 让调用者决定是否退出
-raise e
-
-# ==================== 新增的导入核心函数 ====================
+# ==================== 核心导入函数 ====================
 def import_single_file_with_lock(file_path):
     """
     使用包含锁和动态分区名的事务来导入单个文件。
-    该函数包含两个主要步骤：
+    逻辑流程：
     1. 查询数据库获取当前活动的、格式化好的分区表名。
-    2. 构建并执行一个包含 BEGIN, LOCK, COPY, COMMIT 的 shell 命令。
+    2. 构建并执行一个包含 BEGIN, LOCK, COPY, COMMIT 的组合 shell 命令。
     """
+
     # --- 步骤 1: 查询数据库，获取当前活动的、格式化好的分区表名 ---
+    # SQL 逻辑: 拼接字符串生成如 "performance_wa_005" 这样的表名
     get_partition_sql = (
         f"SELECT '\"{TARGET_TABLE_BASE}_wa_' || lpad(value::text, 3, '0') || '\"' "
         f"FROM \"public\".\"geomesa_wa_seq\" WHERE type_name = '{TARGET_TABLE_BASE}'"
     )
+
+    # 构建 docker exec psql 命令，使用 -tA 参数获取纯净输出
     get_partition_cmd = (
         f"docker exec {CONTAINER_NAME} "
         f"psql -U {DB_USER} -d {DB_NAME} -tA -c {shlex.quote(get_partition_sql)}"
     )
 
     try:
+        # 执行查询
         result = run_command(get_partition_cmd, capture_output=True)
         partition_name = result.stdout.strip()
+
+        # 检查结果是否为空
         if not partition_name:
-            # 如果查询结果为空，这是一个严重错误，直接抛出异常
             raise ValueError(f"未能从 geomesa_wa_seq 获取到分区名 (type_name='{TARGET_TABLE_BASE}')")
 
         logging.info(f"      -> 动态获取分区表名: {partition_name}")
@@ -100,31 +100,41 @@ def import_single_file_with_lock(file_path):
     except (subprocess.CalledProcessError, ValueError) as e:
         logging.error(f"      -> 获取动态分区表名失败！")
         if isinstance(e, subprocess.CalledProcessError):
-            logging.error(f"      -> 错误输出: {e.stderr.strip()}")
+            # 如果是命令执行错，run_command 已经打印过日志，这里可以补充上下文
+            pass
         else:
             logging.error(f"      -> 错误原因: {e}")
-        # 返回一个模拟的失败结果，让主循环处理
+
+        # 返回一个模拟的失败结果对象，以便主循环统计失败次数
+        # 构造一个非零 returncode 的对象
         return subprocess.CompletedProcess(args=get_partition_cmd, returncode=1, stderr=str(e))
 
     # --- 步骤 2: 构建并执行包含完整事务的最终加载命令 ---
+
+    # 要锁定的主表名 (例如 "performance_wa")
     lock_table_name = f'"{TARGET_TABLE_BASE}_wa"'
+
+    # COPY 选项
     copy_options = "WITH (FORMAT text, DELIMITER E'|', NULL E'')"
+
+    # 动态构建 COPY 语句
     copy_sql = f"COPY public.{partition_name}(fid,geom,dtg,taxi_id) FROM STDIN {copy_options};"
 
-    # 结构: ( {一系列echo输出SQL脚本; cat文件内容; echo结束符和COMMIT;} ) | psql
+    # 构建最终的 Shell 命令
+    # 结构: ( { echo SQL; cat FILE; echo END; } ) | docker exec ... psql
     final_cmd = (
         f'({{ '
         f'echo "BEGIN;"; '
         f'echo \'LOCK TABLE public.{lock_table_name} IN SHARE UPDATE EXCLUSIVE MODE;\'; '
-        f'echo {shlex.quote(copy_sql)}; '
-        f'cat {file_path}; '
-        f'echo; echo "\\."; '  # COPY FROM STDIN 的结束标记
+        f'echo {shlex.quote(copy_sql)}; '  # 安全引用 SQL
+        f'cat {file_path}; '                # 注入文件内容
+        f'echo; echo "\\."; '               # 注入 COPY 结束符 (确保换行)
         f'echo "COMMIT;"; '
         f'}} ) | docker exec -i {CONTAINER_NAME} '
         f'psql -U {DB_USER} -d {DB_NAME} -q -v ON_ERROR_STOP=1'
     )
 
-    # 执行最终的导入命令
+    # 执行最终导入，不需要 capture_output=True (避免大文件输出占满内存)，除非出错调试
     return run_command(final_cmd, check=False, capture_output=True)
 
 
@@ -132,34 +142,34 @@ def import_single_file_with_lock(file_path):
 def main():
     logging.info("=" * 50)
     start_total_time = time.time()
-    logging.info(f"开始全量数据导入流程...")
+    logging.info(f"开始全量数据导入流程 (带锁机制)...")
     logging.info("=" * 50)
 
-    # 1. 禁用 GeoMesa 特性
-    logging.info("\n>>> 阶段 1: 禁用 GeoMesa 特性...")
-    run_command(f"bash {DISABLE_SCRIPT}")
+    # 1. (已移除禁用 GeoMesa 步骤)
 
     # 2. 清空目标表的 *所有分区*
-    # --- 已修改 ---
-    # 注意：这里我们清空的是主分区表，它会自动级联清空所有子分区
-    logging.info(f"\n>>> 阶段 2: 清空主分区表 '{TARGET_TABLE_BASE}_wa' (将级联清空所有子分区)...")
-    run_command(
-        f"docker exec -i {CONTAINER_NAME} psql -U {DB_USER} -d {DB_NAME} -c 'TRUNCATE {TARGET_TABLE_BASE}_wa;'"
-    )
-    logging.info("所有分区表已清空。")
+    # 注意：TRUNCATE 主分区表会自动级联清空所有子分区
+    logging.info(f"\n>>> 阶段 1: 清空主分区表 '{TARGET_TABLE_BASE}_wa' (将级联清空所有子分区)...")
+    try:
+        run_command(
+            f"docker exec -i {CONTAINER_NAME} psql -U {DB_USER} -d {DB_NAME} -c 'TRUNCATE {TARGET_TABLE_BASE}_wa;'"
+        )
+        logging.info("所有分区表已清空。")
+    except subprocess.CalledProcessError:
+        logging.error("清空表失败，脚本终止。")
+        sys.exit(1)
 
     # 3. 查找要导入的文件列表
-    logging.info("\n>>> 阶段 3: 查找数据文件...")
+    logging.info("\n>>> 阶段 2: 查找数据文件...")
     tbl_files = sorted(TBL_DIR_IN_LOCAL.glob("*.tbl"))
     total_files = len(tbl_files)
     if total_files == 0:
         logging.error(f"在目录 '{TBL_DIR_IN_LOCAL}' 中未找到任何 .tbl 文件。")
-        run_command(f"bash {ENABLE_SCRIPT}")
         sys.exit(1)
     logging.info(f"共找到 {total_files} 个文件需要导入。")
 
     # 4. 循环导入文件并计时
-    logging.info("\n>>> 阶段 4: 开始循环导入文件...")
+    logging.info("\n>>> 阶段 3: 开始循环导入文件...")
     success_count = 0
     fail_count = 0
     total_import_duration = 0.0  # 总导入耗时（秒）
@@ -167,9 +177,10 @@ def main():
     for i, file_path in enumerate(tbl_files, 1):
         filename = file_path.name
         logging.info(f"  -> 正在导入文件 {i}/{total_files}: {filename} ... ")
+
         import_start = time.time()
 
-        # --- 已修改: 调用新的导入函数 ---
+        # 调用带锁的核心导入函数
         result = import_single_file_with_lock(file_path)
 
         import_end = time.time()
@@ -182,18 +193,15 @@ def main():
         else:
             fail_count += 1
             logging.error(f"  -> 导入文件 {i}/{total_files}: {filename} ... ❌")
-            # 错误信息已经在 import_single_file_with_lock 函数中记录，这里可以只记录简要信息
-            logging.error(f"      -> 导入失败，请检查上方日志获取详细错误。")
+            # 错误详情已在函数内记录，这里提示用户去检查日志
+            logging.error(f"      -> 失败详情请查看上方日志。")
 
     logging.info("\n所有文件导入尝试完毕。")
 
-    # 5. 恢复 GeoMesa 特性
-    logging.info(f"\n>>> 阶段 5: 恢复 GeoMesa 特性...")
-    run_command(f"bash {ENABLE_SCRIPT}")
+    # 5. (已移除恢复 GeoMesa 步骤)
 
     # 6. 生成最终报告
-    # ... (这部分无需修改，逻辑完全兼容) ...
-    logging.info(f"\n>>> 阶段 6: 生成最终报告...")
+    logging.info(f"\n>>> 阶段 4: 生成最终报告...")
     logging.info("=" * 50)
     logging.info(" 全量数据导入完成 - 性能报告")
     logging.info("=" * 50)
@@ -211,6 +219,7 @@ def main():
     if success_count > 0:
         total_rows_imported = success_count * ROWS_PER_FILE
         avg_time_per_file = total_import_duration / success_count
+
         if total_import_duration > 0:
             overall_throughput = int(total_rows_imported / total_import_duration)
             avg_ms_per_row = (total_import_duration * 1000) / total_rows_imported
@@ -227,26 +236,35 @@ def main():
 
     logging.info("-" * 50)
 
+    # 最终数据量验证
     logging.info("最终数据量验证...")
-    # --- 已修改 ---
-    # 验证时，从主分区表查询，它会包含所有子分区的数据
+    # 验证主分区表，它包含所有子分区的数据
     final_count_table = f"{TARGET_TABLE_BASE}_wa"
+
     cmd = (
         f"docker exec -i {CONTAINER_NAME} psql -U {DB_USER} -d {DB_NAME} -t -c 'SELECT count(1) FROM {final_count_table};'"
         " 2>/dev/null | tr -d '[:space:]'"
     )
-    result = run_command(cmd, check=False, capture_output=True)
-    final_count = result.stdout.strip()
 
-    if result.returncode == 0 and final_count and final_count.isdigit():
-        logging.info(f"  -> '{final_count_table}' 表中的总记录数: {final_count}")
-        expected_rows = success_count * ROWS_PER_FILE
-        if int(final_count) == expected_rows:
-            logging.info("  -> 【成功】数据量与预期完全相符！")
+    # 这里不需要抛出异常，只是验证
+    try:
+        result = run_command(cmd, check=False, capture_output=True)
+        final_count = result.stdout.strip()
+
+        if result.returncode == 0 and final_count and final_count.isdigit():
+            logging.info(f"  -> '{final_count_table}' 表中的总记录数: {final_count}")
+
+            expected_rows = success_count * ROWS_PER_FILE
+            # 允许一点误差（例如文件行数不完全一致），这里设定为完全匹配
+            if int(final_count) == expected_rows:
+                logging.info("  -> 【成功】数据量与预期完全相符！")
+            else:
+                logging.warning(f"  -> 【警告】最终数据量 ({final_count}) 与预期 ({expected_rows}) 不符，请检查。")
         else:
-            logging.warning("  -> 【警告】最终数据量与成功导入文件数不符，请检查。")
-    else:
-        logging.warning("  -> 【警告】无法获取最终数据量统计。")
+            logging.warning("  -> 【警告】无法获取最终数据量统计，或返回结果无效。")
+
+    except Exception as e:
+        logging.warning(f"  -> 【警告】验证步骤发生错误: {e}")
 
     logging.info("=" * 50)
 
