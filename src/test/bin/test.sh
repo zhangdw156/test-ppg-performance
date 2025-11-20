@@ -25,7 +25,6 @@ fi
 # ==============================================================================
 echo ">>> 步骤 0: 正在清理 ${TARGET_TABLE_BASE} 中的历史数据..."
 # 使用 DELETE 语句清空数据
-# 注意：如果数据量达到数亿行，DELETE 可能会非常慢，建议确认是否可以使用 TRUNCATE
 docker exec "${CONTAINER_NAME}" \
   psql -U "${DB_USER}" -d "${DB_NAME}" \
   -c "DELETE FROM \"public\".\"${TARGET_TABLE_BASE}\";"
@@ -92,4 +91,23 @@ FINAL_COUNT=$(docker exec "${CONTAINER_NAME}" \
 
 echo "=============================================="
 echo "   ${TARGET_TABLE_BASE} 最终记录数: ${FINAL_COUNT}"
+echo "=============================================="
+
+# ==============================================================================
+# 步骤 4: (后清理) 再次清除 performance 里的数据
+# ==============================================================================
+echo ">>> 步骤 4: [后清理] 正在清除 ${TARGET_TABLE_BASE} 中的数据以释放空间/重置环境..."
+
+# 同样使用 DELETE 或 TRUNCATE
+# TRUNCATE public.performance_wa CASCADE; 通常比 DELETE 更快且能回收空间，
+# 但如果目标是视图 'performance'，通常只能用 DELETE。
+# 如果您确定是对主分区表操作，建议用: TRUNCATE "public"."${TARGET_TABLE_BASE}_wa";
+# 这里为了稳妥，继续使用针对视图的 DELETE。
+
+time docker exec "${CONTAINER_NAME}" \
+  psql -U "${DB_USER}" -d "${DB_NAME}" \
+  -c "DELETE FROM \"public\".\"${TARGET_TABLE_BASE}\";"
+
+echo "=============================================="
+echo "   数据已全部清除。"
 echo "=============================================="
