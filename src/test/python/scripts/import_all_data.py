@@ -50,13 +50,13 @@ def run_command(cmd, check=True, capture_output=False):
             logging.error(f"错误输出: {e.stderr.strip()}")
         raise e
 
-# ==================== 核心导入函数 (重大修改) ====================
+# ==================== 核心导入函数 ====================
 def import_single_file_with_lock(file_path):
     """
     使用 Python Popen 流式传输数据，精确控制换行符，避免 'literal newline' 错误。
     """
 
-    # --- 步骤 1: 获取动态分区表名 (保持不变) ---
+    # --- 步骤 1: 获取动态分区表名 ---
     get_partition_sql = (
         f"SELECT '\"{TARGET_TABLE_BASE}_wa_' || lpad(value::text, 3, '0') || '\"' "
         f"FROM \"public\".\"geomesa_wa_seq\" WHERE type_name = '{TARGET_TABLE_BASE}'"
@@ -89,9 +89,9 @@ def import_single_file_with_lock(file_path):
         f"BEGIN;\n"
         f"LOCK TABLE public.{lock_table_name} IN SHARE UPDATE EXCLUSIVE MODE;\n"
         f"{copy_sql}\n"
-    ).encode('utf-8') # 转换为字节
+    ).encode('utf-8')
 
-    # 2. 准备 SQL 尾部 (确保 \. 单独一行)
+    # 2. 准备 SQL 尾部
     sql_footer = b"\\.\nCOMMIT;\n"
 
     # 3. 启动 psql 进程
@@ -99,7 +99,6 @@ def import_single_file_with_lock(file_path):
 
     proc = None
     try:
-        # 打开进程，准备向 stdin 写入
         proc = subprocess.Popen(
             psql_cmd,
             shell=True,
@@ -113,40 +112,33 @@ def import_single_file_with_lock(file_path):
 
         # B. 流式写入文件内容
         has_trailing_newline = False
-        # 使用二进制模式读取，避免编码问题，且效率更高
         with open(file_path, 'rb') as f:
-            # 分块读取 (1MB 缓冲区)，比一次性读取省内存
             while chunk := f.read(1024 * 1024):
                 proc.stdin.write(chunk)
-                # 检查最后一个字节是否是换行符
                 if chunk:
                     has_trailing_newline = chunk.endswith(b'\n')
 
-        # C. 关键修正：只有当文件末尾没有换行符时，才补一个换行符
+        # C. 补换行符
         if not has_trailing_newline:
             proc.stdin.write(b'\n')
 
-        # D. 写入 SQL 尾部 (\. 和 COMMIT)
+        # D. 写入 SQL 尾部
         proc.stdin.write(sql_footer)
 
-        # E. 关闭 stdin，发送 EOF 信号，并获取输出
+        # E. 获取输出
         stdout_bytes, stderr_bytes = proc.communicate()
 
-        # 构建返回对象
         stdout_str = stdout_bytes.decode('utf-8', errors='replace')
         stderr_str = stderr_bytes.decode('utf-8', errors='replace')
 
         if proc.returncode != 0:
-            # 模拟 CalledProcessError 以便主逻辑捕获
             raise subprocess.CalledProcessError(proc.returncode, psql_cmd, output=stdout_str, stderr=stderr_str)
 
         return subprocess.CompletedProcess(args=psql_cmd, returncode=0, stdout=stdout_str, stderr=stderr_str)
 
     except subprocess.CalledProcessError as e:
-        # 捕获我们自己抛出的异常
         return subprocess.CompletedProcess(args=psql_cmd, returncode=e.returncode, stderr=e.stderr)
     except Exception as e:
-        # 捕获 IO 错误或其他异常
         error_msg = f"Python Popen 异常: {str(e)}"
         logging.error(error_msg)
         if proc:
@@ -162,10 +154,10 @@ def main():
     logging.info("=" * 50)
 
     # 1. 清空目标表
-    logging.info(f"\n>>> 阶段 1: 清空主分区表 '{TARGET_TABLE_BASE}_wa'...")
+    logging.info(f"\n>>> 阶段 1: 清空数据 '{TARGET_TABLE_BASE}'...")
     try:
         run_command(
-            f"docker exec -i {CONTAINER_NAME} psql -U {DB_USER} -d {DB_NAME} -c 'TRUNCATE {TARGET_TABLE_BASE}_wa;'"
+            f"docker exec -i {CONTAINER_NAME} psql -U {DB_USER} -d {DB_NAME} -c 'TRUNCATE {TARGET_TABLE_BASE};'"
         )
         logging.info("所有分区表已清空。")
     except subprocess.CalledProcessError:
@@ -234,9 +226,12 @@ def main():
 
     logging.info("-" * 50)
 
-    # 最终数据量验证
+    # ==================== 最终数据量验证 (已修改) ====================
     logging.info("最终数据量验证...")
-    final_count_table = f"{TARGET_TABLE_BASE}_wa"
+
+    # 修改处：不再拼接 _wa 后缀，直接使用基础表名 "performance"
+    final_count_table = TARGET_TABLE_BASE
+
     cmd = (
         f"docker exec -i {CONTAINER_NAME} psql -U {DB_USER} -d {DB_NAME} -t -c 'SELECT count(1) FROM {final_count_table};'"
         " 2>/dev/null | tr -d '[:space:]'"
@@ -245,12 +240,13 @@ def main():
         result = run_command(cmd, check=False, capture_output=True)
         final_count = result.stdout.strip()
         if result.returncode == 0 and final_count and final_count.isdigit():
-            logging.info(f"  -> '{final_count_table}' 表中的总记录数: {final_count}")
+            logging.info(f"  -> '{final_count_table}' 表 (主表/视图) 中的总记录数: {final_count}")
             expected_rows = success_count * ROWS_PER_FILE
             if int(final_count) == expected_rows:
                 logging.info("  -> 【成功】数据量与预期完全相符！")
             else:
                 logging.warning(f"  -> 【警告】最终数据量 ({final_count}) 与预期 ({expected_rows}) 不符。")
+                logging.warning(f"      (提示：如果是首次全量导入，请确认之前的历史数据是否已清空，或者是否存在数据重复)")
         else:
             logging.warning("  -> 【警告】无法获取最终数据量统计。")
     except Exception as e:
