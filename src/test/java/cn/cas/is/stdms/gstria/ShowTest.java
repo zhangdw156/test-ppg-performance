@@ -15,11 +15,11 @@ public class ShowTest {
         GeomesaTestUtils.prepareData("Hogwarts", DataStoreConfig.HBASE);
         GeomesaTestUtils.prepareData("mutants", DataStoreConfig.HBASE);
 
-        GeomesaTestUtils.prepareData("beijing_subway", DataStoreConfig.PG);
-        GeomesaTestUtils.prepareData("beijing_subway_station", DataStoreConfig.PG);
-
-        GeomesaTestUtils.prepareData("Hogwarts", DataStoreConfig.PPG);
-        GeomesaTestUtils.prepareData("mutants", DataStoreConfig.PPG);
+//        GeomesaTestUtils.prepareData("beijing_subway", DataStoreConfig.PG);
+//        GeomesaTestUtils.prepareData("beijing_subway_station", DataStoreConfig.PG);
+//
+//        GeomesaTestUtils.prepareData("Hogwarts", DataStoreConfig.PPG);
+//        GeomesaTestUtils.prepareData("mutants", DataStoreConfig.PPG);
     }
 
     @Test
