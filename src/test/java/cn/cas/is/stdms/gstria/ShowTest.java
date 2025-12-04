@@ -15,6 +15,9 @@ public class ShowTest {
 
         GeomesaTestUtils.prepareData("beijing_subway", DataStoreConfig.PG);
         GeomesaTestUtils.prepareData("beijing_subway_station", DataStoreConfig.PG);
+
+//        GeomesaTestUtils.prepareData("Hogwarts", DataStoreConfig.HBASE);
+//        GeomesaTestUtils.prepareData("mutants", DataStoreConfig.HBASE);
     }
 
     @Test

@@ -35,7 +35,7 @@ public class IngestDataTest {
 
     public static DataStoreConfig dataStoreConfig = DataStoreConfig.HBASE;
     public static String typeName = "beijing_taxi";
-    public static String datasetPath = "/datas/zhangdw/datasets/beijingshi_tbl_5000k";
+    public static String datasetPath = "/datas/zhangdw/datasets/beijingshi_tbl_100k";
 
     @Test
     public void importAllTblFiles() throws Exception {
@@ -120,13 +120,19 @@ public class IngestDataTest {
         Path filePath = Paths.get(resourcePath);
         String fileName = filePath.getFileName().toString();
 
-        // 解析文件名获取 taxi_id (如果文件名是 id.tbl)
-        String taxiIdStr = fileName.contains(".") ? fileName.substring(0, fileName.lastIndexOf('.')) : fileName;
+        String nameWithoutExt = fileName.contains(".") ? fileName.substring(0, fileName.lastIndexOf('.')) : fileName;
+
         Integer fileTaxiId = 0;
         try {
-            fileTaxiId = Integer.parseInt(taxiIdStr);
+            if (nameWithoutExt.contains("_")) {
+                String numPart = nameWithoutExt.substring(nameWithoutExt.lastIndexOf('_') + 1);
+                fileTaxiId = Integer.parseInt(numPart);
+            } else {
+                fileTaxiId = Integer.parseInt(nameWithoutExt);
+            }
         } catch (NumberFormatException e) {
-            // 如果文件名不是数字，保持 0
+            log.warn("Filename '{}' does not contain a valid integer ID. Using default 0.", fileName);
+            fileTaxiId = 0;
         }
 
         CSVFormat tblFormat = CSVFormat.Builder.create()

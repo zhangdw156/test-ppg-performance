@@ -34,8 +34,8 @@ public class IngestDataSshTest {
     public static DataStoreConfig dataStoreConfig = DataStoreConfig.HBASE;
     public static String typeName = "beijing_taxi";
 
-    // 远程配置
-    public static String datasetPath = "zhangdw@192.168.1.232:/data6/zhangdw/datasets/beijingshi_tbl_100k";
+//    public static String datasetPath = "zhangdw@192.168.1.232:/data6/zhangdw/datasets/beijingshi_tbl_100k";
+    public static String datasetPath = "/datas/zhangdw/datasets/beijingshi_tbl_100k";
     public static String SSH_PASSWORD = "ds123456"; // 替换密码
 
     // 线程数（同时也是 SSH 连接数，建议不要超过 20，以免触发服务器防火墙）
@@ -152,7 +152,6 @@ public class IngestDataSshTest {
         }
     }
 
-    // --- 辅助逻辑保持不变，但提取了 createSession ---
 
     private Session createSession(SshInfo info) throws JSchException {
         JSch jsch = new JSch();
@@ -186,48 +185,83 @@ public class IngestDataSshTest {
     }
 
     private void processStream(InputStream inputStream, String fileName, DataStore ds) throws Exception {
-        // ... (保持你之前的解析逻辑不变) ...
-        // 为了节省篇幅，这里简写，请将上一版 processStream 的完整内容放回这里
         SimpleFeatureType sft = ds.getSchema(typeName);
         SimpleFeatureBuilder featureBuilder = new SimpleFeatureBuilder(sft);
+
+        // 几何对象解析器
         WKTReader wktReader = new WKTReader(JTSFactoryFinder.getGeometryFactory());
+
+        // 时间格式解析器
         SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
         dateFormat.setTimeZone(TimeZone.getTimeZone("Asia/Shanghai"));
+
         List<SimpleFeature> features = new ArrayList<>();
 
-        // 简化的 ID 获取
-        String taxiIdStr = fileName.contains(".") ? fileName.substring(0, fileName.lastIndexOf('.')) : fileName;
+        String nameWithoutExt = fileName.contains(".") ? fileName.substring(0, fileName.lastIndexOf('.')) : fileName;
         Integer fileTaxiId = 0;
         try {
-            fileTaxiId = Integer.parseInt(taxiIdStr);
-        } catch (Exception ignored) {
+            if (nameWithoutExt.contains("_")) {
+                String numPart = nameWithoutExt.substring(nameWithoutExt.lastIndexOf('_') + 1);
+                fileTaxiId = Integer.parseInt(numPart);
+            } else {
+                fileTaxiId = Integer.parseInt(nameWithoutExt);
+            }
+        } catch (NumberFormatException e) {
+            // log.warn("Filename '{}' ID parse error, default to 0", fileName);
+            fileTaxiId = 0;
         }
 
+        // --- 2. 配置 CSV 格式 (竖线分隔) ---
         CSVFormat tblFormat = CSVFormat.Builder.create()
-                .setDelimiter('|').setQuote(null).setIgnoreEmptyLines(true).setTrim(true).build();
+                .setDelimiter('|')
+                .setQuote(null)
+                .setIgnoreEmptyLines(true)
+                .setTrim(true)
+                .build();
 
+        // --- 3. 流式读取与解析 ---
         try (InputStreamReader reader = new InputStreamReader(inputStream, StandardCharsets.UTF_8);
              CSVParser parser = new CSVParser(reader, tblFormat)) {
+
             for (CSVRecord record : parser) {
                 try {
+                    // 数据格式: UUID | SRID=4326;POINT(x y) | Time | ...
+
+                    // A. 获取 UUID (第0列)
                     String originalId = record.get(0);
+
+                    // B. 解析 Geometry (第1列)
                     String rawWkt = record.get(1);
-                    String cleanWkt = rawWkt.contains(";") ? rawWkt.split(";")[1] : rawWkt;
+                    String cleanWkt = rawWkt;
+                    // 去除 SRID=4326; 前缀
+                    if (rawWkt.contains(";")) {
+                        cleanWkt = rawWkt.split(";")[1];
+                    }
                     Geometry geometry = wktReader.read(cleanWkt);
+
+                    // C. 解析时间 (第2列)
                     Date date = dateFormat.parse(record.get(2));
 
+                    // D. 设置属性
                     featureBuilder.set("geom", geometry);
                     featureBuilder.set("dtg", date);
                     featureBuilder.set("taxi_id", fileTaxiId);
+
+                    // E. 构建 Feature
                     features.add(featureBuilder.buildFeature(originalId));
+
                 } catch (Exception e) {
+                    // 忽略单行解析错误，避免中断整个文件
                 }
             }
         }
 
+        // --- 4. 批量写入 HBase ---
         if (!features.isEmpty()) {
             SimpleFeatureStore featureStore = (SimpleFeatureStore) ds.getFeatureSource(typeName);
             featureStore.addFeatures(DataUtilities.collection(features));
+            // 这里的日志在多线程下可能会有点乱，可以根据需要注释掉
+            // log.info("Imported {} features from {}", features.size(), fileName);
         }
     }
 
