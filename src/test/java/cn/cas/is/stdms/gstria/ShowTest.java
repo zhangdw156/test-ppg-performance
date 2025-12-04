@@ -1,9 +1,11 @@
 package cn.cas.is.stdms.gstria;
 
+import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 
+@Slf4j
 public class ShowTest {
 
     @Test

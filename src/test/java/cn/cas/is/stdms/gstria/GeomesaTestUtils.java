@@ -276,8 +276,7 @@ public class GeomesaTestUtils {
    */
   public static void dropData(String tableName, DataStoreConfig dataStoreConfig)
       throws IOException {
-    Map<String, Object> params = dataStoreConfig.toMap();
-    DataStore ds = dsCache.getIfPresent(params);
+    DataStore ds = prepareDs(dataStoreConfig);
 
     if (ds != null) {
       try {
