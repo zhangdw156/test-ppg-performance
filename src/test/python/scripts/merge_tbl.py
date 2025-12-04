@@ -13,10 +13,9 @@ def merge_tbl_by_lines(src_dir, batch_size):
         print(f"提示：源文件夹 '{src_dir}' 中没有找到.tbl文件")
         return
 
-    # 生成输出目录（与源文件夹同级：源文件夹名_100k）
     src_folder_name = os.path.basename(src_dir)
     src_parent_dir = os.path.dirname(src_dir)
-    dst_dir = os.path.join(src_parent_dir, f"{src_folder_name}_100k")  # 10k表示10000行
+    dst_dir = os.path.join(src_parent_dir, f"{src_folder_name}_{batch_size//1000}k")  # 10k表示10000行
     os.makedirs(dst_dir, exist_ok=True)
     print(f"输出目录已创建（与源文件夹同级）：{dst_dir}")
 
@@ -66,5 +65,4 @@ def merge_tbl_by_lines(src_dir, batch_size):
 if __name__ == "__main__":
     # 替换为你的.tbl文件所在文件夹路径
     source_directory = r"D:\datasets\beijingshi_tbl"
-    # 每10000行合并一个文件（可修改batch_size参数调整行数）
-    merge_tbl_by_lines(source_directory, batch_size=100_000)
+    merge_tbl_by_lines(source_directory, batch_size=5_000_000)
